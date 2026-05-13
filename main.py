@@ -11,12 +11,11 @@ from pydantic import BaseModel
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
 
 
-# -----------------------------
-# CONFIG APP
-# -----------------------------
+# -----------------------------------
+# CONFIGURACIÓN APP
+# -----------------------------------
 app = FastAPI(
     title="AuditCont API",
     version="1.0.0"
@@ -30,13 +29,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Base temporal en memoria
+# base temporal
 analyses_db = {}
 
 
-# -----------------------------
+# -----------------------------------
 # MODELOS
-# -----------------------------
+# -----------------------------------
 class Finding(BaseModel):
     id: int
     type: str
@@ -57,30 +56,33 @@ class AuditResult(BaseModel):
     recommendations: List[str]
 
 
-# -----------------------------
+# -----------------------------------
 # HEALTH CHECK
-# -----------------------------
+# -----------------------------------
 @app.get("/health")
 def health_check():
     return {
-        "status": "connected",
-        "message": "AuditCont funcionando correctamente"
+        "status": "ok",
+        "message": "Backend funcionando correctamente"
     }
 
 
-# -----------------------------
+# -----------------------------------
 # ANALIZAR ARCHIVO
-# -----------------------------
+# -----------------------------------
 @app.post("/api/v1/analyze", response_model=AuditResult)
 async def analyze_file(file: UploadFile = File(...)):
-    
-    if not file:
-        raise HTTPException(status_code=400, detail="Debe subir un archivo")
-
-    content = await file.read()
-    file_size_kb = len(content) / 1024
 
     try:
+        if not file:
+            raise HTTPException(
+                status_code=400,
+                detail="Debe subir un archivo"
+            )
+
+        content = await file.read()
+        file_size_kb = len(content) / 1024
+
         # Leer archivo
         if file.filename.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(content))
@@ -89,54 +91,69 @@ async def analyze_file(file: UploadFile = File(...)):
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Solo se aceptan archivos Excel o CSV"
+                detail="Solo se permiten archivos Excel o CSV"
             )
 
-        # Normalizar nombres columnas
+        # limpiar nombres de columnas
         df.columns = [
-            str(col).lower().strip().replace(" ", "_")
+            str(col).strip().lower().replace(" ", "_")
             for col in df.columns
         ]
 
-        print("Columnas detectadas:", df.columns.tolist())
+        print("COLUMNAS DETECTADAS:")
+        print(df.columns.tolist())
 
-        # Buscar columnas requeridas
+        # detectar columnas automáticamente
+        cuenta_col = next(
+            (c for c in df.columns if "cuenta" in c),
+            None
+        )
+
         tipo_col = next(
             (c for c in df.columns if "tipo" in c),
             None
         )
 
         valor_col = next(
-            (c for c in df.columns if "valor" in c or "saldo" in c),
-            None
-        )
-
-        cuenta_col = next(
-            (c for c in df.columns if "cuenta" in c),
+            (
+                c for c in df.columns
+                if "valor" in c
+                or "saldo" in c
+                or "monto" in c
+            ),
             None
         )
 
         if not tipo_col:
             raise HTTPException(
                 status_code=400,
-                detail="No existe columna tipo"
+                detail=f"No se encontró columna TIPO. Columnas detectadas: {df.columns.tolist()}"
             )
 
         if not valor_col:
             raise HTTPException(
                 status_code=400,
-                detail="No existe columna valor o saldo"
+                detail=f"No se encontró columna VALOR/SALDO. Columnas detectadas: {df.columns.tolist()}"
             )
 
-        # Limpiar datos
+        # limpiar columna tipo
         df[tipo_col] = df[tipo_col].astype(str).str.upper()
+
+        # limpiar valores monetarios
+        df[valor_col] = (
+            df[valor_col]
+            .astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
 
         df[valor_col] = pd.to_numeric(
             df[valor_col],
             errors="coerce"
         ).fillna(0)
 
-        # Totales
+        # calcular totales
         total_activos = df[
             df[tipo_col].str.contains("ACTIVO", na=False)
         ][valor_col].sum()
@@ -157,6 +174,7 @@ async def analyze_file(file: UploadFile = File(...)):
 
         findings = []
 
+        # validación balance
         if not balanceado:
             findings.append(
                 Finding(
@@ -169,12 +187,13 @@ Activos: {total_activos}
 Pasivos: {total_pasivos}
 Patrimonio: {total_patrimonio}
 Diferencia: {diferencia}
-""",
+                    """,
                     account="General",
                     recommendation="Revisar balance contable"
                 )
             )
 
+        # detectar negativos
         negativos = df[df[valor_col] < 0]
 
         if not negativos.empty:
@@ -183,13 +202,14 @@ Diferencia: {diferencia}
                     id=2,
                     type="negative",
                     severity="high",
-                    title="Valores negativos detectados",
+                    title="Saldos negativos detectados",
                     desc=f"Se encontraron {len(negativos)} cuentas negativas",
                     account="General",
-                    recommendation="Revisar saldos negativos"
+                    recommendation="Revisar cuentas con saldo negativo"
                 )
             )
 
+        # si todo está bien
         if len(findings) == 0:
             findings.append(
                 Finding(
@@ -197,7 +217,7 @@ Diferencia: {diferencia}
                     type="success",
                     severity="low",
                     title="Balance correcto",
-                    desc="No se encontraron errores",
+                    desc="No se detectaron errores",
                     account="General",
                     recommendation="Todo correcto"
                 )
@@ -205,8 +225,8 @@ Diferencia: {diferencia}
 
         recommendations = [
             "Revisar balances antes de enviar a Supercias",
-            "Corregir saldos negativos",
-            "Mantener consistencia en tipos de cuenta"
+            "Verificar saldos negativos",
+            "Mantener estructura contable estándar"
         ]
 
         audit_id = str(uuid.uuid4())[:8]
@@ -238,9 +258,9 @@ Diferencia: {diferencia}
         )
 
 
-# -----------------------------
-# PDF
-# -----------------------------
+# -----------------------------------
+# GENERAR PDF
+# -----------------------------------
 @app.get("/api/v1/reports/{audit_id}/pdf")
 def generate_pdf(audit_id: str):
 
@@ -259,34 +279,31 @@ def generate_pdf(audit_id: str):
     pdf.drawString(100, 750, "AuditCont Ecuador AI")
 
     pdf.setFont("Helvetica", 12)
-    pdf.drawString(
-        100,
-        720,
-        f"Archivo: {result.filename}"
-    )
+    pdf.drawString(100, 720, f"Archivo: {result.filename}")
+    pdf.drawString(100, 700, f"Fecha: {result.analyzed_at}")
 
     pdf.drawString(
         100,
-        700,
-        f"Fecha: {result.analyzed_at}"
-    )
-
-    pdf.drawString(
-        100,
-        680,
+        670,
         f"Activos: {result.summary['total_assets']}"
     )
 
     pdf.drawString(
         100,
-        660,
+        650,
         f"Pasivos: {result.summary['total_liabilities']}"
     )
 
     pdf.drawString(
         100,
-        640,
+        630,
         f"Patrimonio: {result.summary['total_equity']}"
+    )
+
+    pdf.drawString(
+        100,
+        610,
+        f"Diferencia: {result.summary['difference']}"
     )
 
     pdf.save()
@@ -302,9 +319,9 @@ def generate_pdf(audit_id: str):
     )
 
 
-# -----------------------------
+# -----------------------------------
 # RUN LOCAL
-# -----------------------------
+# -----------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
