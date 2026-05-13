@@ -2,14 +2,26 @@ import io
 import uuid
 import pandas as pd
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import List, Dict, Any
 
-app = FastAPI(title="AuditCont API")
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-# CORS
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+
+
+# -----------------------------
+# CONFIG APP
+# -----------------------------
+app = FastAPI(
+    title="AuditCont API",
+    version="1.0.0"
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,10 +30,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Base temporal en memoria
 analyses_db = {}
 
-# ---------------- MODELOS ----------------
 
+# -----------------------------
+# MODELOS
+# -----------------------------
 class Finding(BaseModel):
     id: int
     type: str
@@ -42,44 +57,31 @@ class AuditResult(BaseModel):
     recommendations: List[str]
 
 
-# ---------------- FUNCIÓN DETECTAR TIPO ----------------
-
-def detect_account_type(code):
-    code = str(code)
-
-    if code.startswith("1"):
-        return "activo"
-    elif code.startswith("2"):
-        return "pasivo"
-    elif code.startswith("3"):
-        return "patrimonio"
-    elif code.startswith("4"):
-        return "ingreso"
-    elif code.startswith("5"):
-        return "gasto"
-    elif code.startswith("6"):
-        return "costo"
-    else:
-        return "otro"
-
-
-# ---------------- HEALTH ----------------
-
+# -----------------------------
+# HEALTH CHECK
+# -----------------------------
 @app.get("/health")
-def health():
+def health_check():
     return {
-        "status": "ok"
+        "status": "connected",
+        "message": "AuditCont funcionando correctamente"
     }
 
 
-# ---------------- ANALYZE ----------------
-
+# -----------------------------
+# ANALIZAR ARCHIVO
+# -----------------------------
 @app.post("/api/v1/analyze", response_model=AuditResult)
 async def analyze_file(file: UploadFile = File(...)):
+    
+    if not file:
+        raise HTTPException(status_code=400, detail="Debe subir un archivo")
+
+    content = await file.read()
+    file_size_kb = len(content) / 1024
 
     try:
-        content = await file.read()
-
+        # Leer archivo
         if file.filename.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(content))
         elif file.filename.endswith(".csv"):
@@ -87,27 +89,25 @@ async def analyze_file(file: UploadFile = File(...)):
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Solo se permiten archivos Excel o CSV"
+                detail="Solo se aceptan archivos Excel o CSV"
             )
 
-        # normalizar columnas
+        # Normalizar nombres columnas
         df.columns = [
-            c.lower().strip()
-            .replace(" ", "_")
-            .replace("ó", "o")
-            for c in df.columns
+            str(col).lower().strip().replace(" ", "_")
+            for col in df.columns
         ]
 
-        print(df.columns)
+        print("Columnas detectadas:", df.columns.tolist())
 
-        # detectar columnas
-        code_col = next(
-            (c for c in df.columns if "codigo" in c),
+        # Buscar columnas requeridas
+        tipo_col = next(
+            (c for c in df.columns if "tipo" in c),
             None
         )
 
-        saldo_col = next(
-            (c for c in df.columns if "saldo" in c),
+        valor_col = next(
+            (c for c in df.columns if "valor" in c or "saldo" in c),
             None
         )
 
@@ -116,36 +116,43 @@ async def analyze_file(file: UploadFile = File(...)):
             None
         )
 
-        if not code_col:
+        if not tipo_col:
             raise HTTPException(
                 status_code=400,
-                detail="No se encontró columna código"
+                detail="No existe columna tipo"
             )
 
-        if not saldo_col:
+        if not valor_col:
             raise HTTPException(
                 status_code=400,
-                detail="No se encontró columna saldo"
+                detail="No existe columna valor o saldo"
             )
 
-        # eliminar filas vacías
-        df = df.dropna(subset=[code_col])
+        # Limpiar datos
+        df[tipo_col] = df[tipo_col].astype(str).str.upper()
 
-        # detectar tipo automáticamente
-        df["tipo_detectado"] = df[code_col].apply(detect_account_type)
-
-        # convertir saldo
-        df[saldo_col] = pd.to_numeric(
-            df[saldo_col],
+        df[valor_col] = pd.to_numeric(
+            df[valor_col],
             errors="coerce"
         ).fillna(0)
 
-        # sumatorias
-        activos = df[df["tipo_detectado"] == "activo"][saldo_col].sum()
-        pasivos = df[df["tipo_detectado"] == "pasivo"][saldo_col].sum()
-        patrimonio = df[df["tipo_detectado"] == "patrimonio"][saldo_col].sum()
+        # Totales
+        total_activos = df[
+            df[tipo_col].str.contains("ACTIVO", na=False)
+        ][valor_col].sum()
 
-        diferencia = activos - (pasivos + patrimonio)
+        total_pasivos = df[
+            df[tipo_col].str.contains("PASIVO", na=False)
+        ][valor_col].sum()
+
+        total_patrimonio = df[
+            df[tipo_col].str.contains("PATRIMONIO", na=False)
+        ][valor_col].sum()
+
+        diferencia = total_activos - (
+            total_pasivos + total_patrimonio
+        )
+
         balanceado = abs(diferencia) < 1
 
         findings = []
@@ -154,50 +161,70 @@ async def analyze_file(file: UploadFile = File(...)):
             findings.append(
                 Finding(
                     id=1,
-                    type="balance",
+                    type="equation",
                     severity="critical",
                     title="Balance descuadrado",
-                    desc=f"Diferencia detectada: {diferencia}",
+                    desc=f"""
+Activos: {total_activos}
+Pasivos: {total_pasivos}
+Patrimonio: {total_patrimonio}
+Diferencia: {diferencia}
+""",
                     account="General",
-                    recommendation="Revisar cuentas contables"
+                    recommendation="Revisar balance contable"
                 )
             )
 
-        negativos = df[df[saldo_col] < 0]
+        negativos = df[df[valor_col] < 0]
 
-        if len(negativos) > 0:
+        if not negativos.empty:
             findings.append(
                 Finding(
                     id=2,
                     type="negative",
                     severity="high",
-                    title="Saldos negativos detectados",
+                    title="Valores negativos detectados",
                     desc=f"Se encontraron {len(negativos)} cuentas negativas",
                     account="General",
-                    recommendation="Revisar registros negativos"
+                    recommendation="Revisar saldos negativos"
                 )
             )
+
+        if len(findings) == 0:
+            findings.append(
+                Finding(
+                    id=3,
+                    type="success",
+                    severity="low",
+                    title="Balance correcto",
+                    desc="No se encontraron errores",
+                    account="General",
+                    recommendation="Todo correcto"
+                )
+            )
+
+        recommendations = [
+            "Revisar balances antes de enviar a Supercias",
+            "Corregir saldos negativos",
+            "Mantener consistencia en tipos de cuenta"
+        ]
 
         audit_id = str(uuid.uuid4())[:8]
 
         result = AuditResult(
             audit_id=audit_id,
             filename=file.filename,
-            filesize=f"{round(len(content)/1024,2)} KB",
-            analyzed_at=str(datetime.now()),
+            filesize=f"{file_size_kb:.2f} KB",
+            analyzed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             summary={
-                "activos": activos,
-                "pasivos": pasivos,
-                "patrimonio": patrimonio,
-                "balanceado": balanceado,
-                "diferencia": diferencia
+                "total_assets": total_activos,
+                "total_liabilities": total_pasivos,
+                "total_equity": total_patrimonio,
+                "difference": diferencia,
+                "equation_balanced": balanceado
             },
             findings=findings,
-            recommendations=[
-                "Revisar cuentas negativas",
-                "Verificar balance general",
-                "Validar consistencia NIIF Ecuador"
-            ]
+            recommendations=recommendations
         )
 
         analyses_db[audit_id] = result
@@ -207,5 +234,81 @@ async def analyze_file(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=f"Error procesando archivo: {str(e)}"
         )
+
+
+# -----------------------------
+# PDF
+# -----------------------------
+@app.get("/api/v1/reports/{audit_id}/pdf")
+def generate_pdf(audit_id: str):
+
+    if audit_id not in analyses_db:
+        raise HTTPException(
+            status_code=404,
+            detail="Auditoría no encontrada"
+        )
+
+    result = analyses_db[audit_id]
+
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawString(100, 750, "AuditCont Ecuador AI")
+
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(
+        100,
+        720,
+        f"Archivo: {result.filename}"
+    )
+
+    pdf.drawString(
+        100,
+        700,
+        f"Fecha: {result.analyzed_at}"
+    )
+
+    pdf.drawString(
+        100,
+        680,
+        f"Activos: {result.summary['total_assets']}"
+    )
+
+    pdf.drawString(
+        100,
+        660,
+        f"Pasivos: {result.summary['total_liabilities']}"
+    )
+
+    pdf.drawString(
+        100,
+        640,
+        f"Patrimonio: {result.summary['total_equity']}"
+    )
+
+    pdf.save()
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition":
+            f"attachment; filename=reporte_{audit_id}.pdf"
+        }
+    )
+
+
+# -----------------------------
+# RUN LOCAL
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )
